@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tray_icon::{
-    menu::{Menu, MenuItem},
     Icon, TrayIconBuilder,
+    menu::{Menu, MenuItem},
 };
 
 const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
@@ -33,7 +33,7 @@ fn main() {
     let home = home_dir().expect("Could not find home directory");
     let steam_base = home.join(".local/share/Steam");
     let log_path = steam_base.join("logs/shader_log.txt");
-    let steamapps_path = steam_base.join("steamapps");
+    let steamapps_paths = find_steamapps_paths(&steam_base);
 
     let current_progress = Arc::new(Mutex::new(ShaderProgress::default()));
     let mut app_cache: HashMap<String, String> = HashMap::new();
@@ -47,7 +47,7 @@ fn main() {
         eprintln!("Warning: Failed to decode embedded icon. Falling back to blank canvas.");
         Icon::from_rgba(vec![128; 16 * 16 * 4], 16, 16).unwrap()
     });
-    
+
     let mut tray_icon = Some(
         TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
@@ -71,10 +71,10 @@ fn main() {
                     if len != last_checked_len {
                         last_checked_len = len;
                         let reader = BufReader::new(file);
-                        
+
                         if let Some(last_line) = reader.lines().filter_map(Result::ok).last() {
                             let mut lock = progress_clone.lock().unwrap();
-                            
+
                             if let Some(caps) = progress_re.captures(&last_line) {
                                 let app_id = caps.get(1).unwrap().as_str().to_string();
                                 let percent_raw = caps.get(2).unwrap().as_str();
@@ -84,9 +84,10 @@ fn main() {
                                 let percent_num = percent_raw.parse::<u32>().unwrap_or(0);
                                 let percent_str = format!("{}%", percent_raw);
 
-                                let app_name = app_cache.entry(app_id.clone()).or_insert_with(|| {
-                                    resolve_app_name(&steamapps_path, &app_id)
-                                }).clone();
+                                let app_name = app_cache
+                                    .entry(app_id.clone())
+                                    .or_insert_with(|| resolve_app_name(&steamapps_paths, &app_id))
+                                    .clone();
 
                                 *lock = ShaderProgress {
                                     app_name,
@@ -96,18 +97,16 @@ fn main() {
                                     total,
                                     is_active: true,
                                 };
-                            } else if let Some(done_caps) = done_re.captures(&last_line) {
-                                let app_id = done_caps.get(1).unwrap().as_str().to_string();
-                                let app_name = app_cache.entry(app_id.clone()).or_insert_with(|| {
-                                    resolve_app_name(&steamapps_path, &app_id)
-                                }).clone();
-                                
+                            } else if done_re.is_match(&last_line) {
                                 if lock.is_active && !lock.app_name.is_empty() {
                                     let _ = Notification::new()
                                         .summary("Steam Shader Monitor")
-                                        .body(&format!("Finished compiling shaders for:\n{}", lock.app_name))
+                                        .body(&format!(
+                                            "Finished compiling shaders for:\n{}",
+                                            lock.app_name
+                                        ))
                                         .appname("shadermon")
-                                        .icon("steam") //Should pull steam icon, i think?
+                                        .icon("steam")
                                         .timeout(Duration::from_secs(5))
                                         .show();
                                 }
@@ -134,7 +133,7 @@ fn main() {
             if data.is_active {
                 let bar = make_progress_bar(data.percent_num);
                 let text = format!(
-                    "{} \n{} {} ( {}/{} )", 
+                    "{} \n{} {} ( {}/{} )",
                     data.app_name, bar, data.percent_str, data.compiled, data.total
                 );
                 progress_item_clone.set_text(text);
@@ -149,7 +148,7 @@ fn main() {
     glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if event.id == quit_item.id() {
-                let _ = tray_icon.take(); 
+                let _ = tray_icon.take();
                 main_loop_clone.quit();
             }
         }
@@ -163,10 +162,10 @@ fn make_progress_bar(percent: u32) -> String {
     let total_blocks = 10;
     let filled_blocks = ((percent as f32 / 100.0) * total_blocks as f32).round() as usize;
     let empty_blocks = total_blocks - filled_blocks;
-    
+
     let filled = "█".repeat(filled_blocks);
     let empty = "░".repeat(empty_blocks);
-    
+
     format!("[{}{}]", filled, empty)
 }
 
@@ -181,16 +180,49 @@ fn load_embedded_icon(bytes: &[u8]) -> Option<Icon> {
     }
 }
 
-fn resolve_app_name(steamapps: &PathBuf, app_id: &str) -> String {
-    let manifest_path = steamapps.join(format!("appmanifest_{}.acf", app_id));
-    if let Ok(file) = File::open(manifest_path) {
+fn find_steamapps_paths(steam_base: &PathBuf) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Always include Steam's default library.
+    paths.push(steam_base.join("steamapps"));
+
+    let library_file = steam_base.join("steamapps/libraryfolders.vdf");
+
+    if let Ok(file) = File::open(library_file) {
         let reader = BufReader::new(file);
-        let name_re = Regex::new(r#""name"\s+"([^"]+)""#).unwrap();
+        let path_re = Regex::new(r#""path"\s+"([^"]+)""#).unwrap();
+
         for line in reader.lines().filter_map(Result::ok) {
-            if let Some(caps) = name_re.captures(&line) {
-                return caps.get(1).unwrap().as_str().to_string();
+            if let Some(caps) = path_re.captures(&line) {
+                let library_path = PathBuf::from(caps.get(1).unwrap().as_str());
+                let steamapps_path = library_path.join("steamapps");
+
+                if !paths.contains(&steamapps_path) {
+                    paths.push(steamapps_path);
+                }
             }
         }
     }
+
+    paths
+}
+
+fn resolve_app_name(steamapps_paths: &[PathBuf], app_id: &str) -> String {
+    let name_re = Regex::new(r#""name"\s+"([^"]+)""#).unwrap();
+
+    for steamapps in steamapps_paths {
+        let manifest_path = steamapps.join(format!("appmanifest_{}.acf", app_id));
+
+        if let Ok(file) = File::open(manifest_path) {
+            let reader = BufReader::new(file);
+
+            for line in reader.lines().filter_map(Result::ok) {
+                if let Some(caps) = name_re.captures(&line) {
+                    return caps.get(1).unwrap().as_str().to_string();
+                }
+            }
+        }
+    }
+
     format!("Unknown App ({})", app_id)
 }
