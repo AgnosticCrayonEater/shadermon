@@ -12,7 +12,8 @@ use tray_icon::{
     menu::{Menu, MenuItem},
 };
 
-const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+const ICON_IDLE_BYTES: &[u8] = include_bytes!("../assets/icon.png");
+const ICON_ACTIVE_BYTES: &[u8] = include_bytes!("../assets/icon-active.png");
 
 #[derive(Debug, Clone, Default)]
 struct ShaderProgress {
@@ -43,16 +44,21 @@ fn main() {
     let quit_item = MenuItem::new("Quit", true, None);
     let _ = tray_menu.append_items(&[&progress_item, &quit_item]);
 
-    let icon = load_embedded_icon(ICON_BYTES).unwrap_or_else(|| {
-        eprintln!("Warning: Failed to decode embedded icon. Falling back to blank canvas.");
+    let idle_icon = load_embedded_icon(ICON_IDLE_BYTES).unwrap_or_else(|| {
+        eprintln!("Warning: Failed to decode idle icon. Falling back to blank canvas.");
         Icon::from_rgba(vec![128; 16 * 16 * 4], 16, 16).unwrap()
+    });
+
+    let active_icon = load_embedded_icon(ICON_ACTIVE_BYTES).unwrap_or_else(|| {
+        eprintln!("Warning: Failed to decode active icon. Falling back to idle icon.");
+        idle_icon.clone()
     });
 
     let mut tray_icon = Some(
         TrayIconBuilder::new()
             .with_menu(Box::new(tray_menu))
             .with_tooltip("Steam Shader Progress")
-            .with_icon(icon)
+            .with_icon(idle_icon.clone())
             .build()
             .unwrap(),
     );
@@ -128,9 +134,21 @@ fn main() {
 
     let progress_ui_clone = Arc::clone(&current_progress);
     let progress_item_clone = progress_item.clone();
+    let idle_icon_clone = idle_icon.clone();
+    let active_icon_clone = active_icon.clone();
+    let main_loop_clone = main_loop.clone();
+    let mut icon_is_active = false;
+
     glib::timeout_add_local(Duration::from_millis(500), move || {
         if let Ok(data) = progress_ui_clone.lock() {
             if data.is_active {
+                if !icon_is_active {
+                    if let Some(ref tray) = tray_icon {
+                        let _ = tray.set_icon(Some(active_icon_clone.clone()));
+                    }
+                    icon_is_active = true;
+                }
+
                 let bar = make_progress_bar(data.percent_num);
                 let text = format!(
                     "{} \n{} {} ( {}/{} )",
@@ -138,20 +156,25 @@ fn main() {
                 );
                 progress_item_clone.set_text(text);
             } else {
+                if icon_is_active {
+                    if let Some(ref tray) = tray_icon {
+                        let _ = tray.set_icon(Some(idle_icon_clone.clone()));
+                    }
+                    icon_is_active = false;
+                }
+
                 progress_item_clone.set_text("No active shader compilation");
             }
         }
-        glib::ControlFlow::Continue
-    });
 
-    let main_loop_clone = main_loop.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
         if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             if event.id == quit_item.id() {
                 let _ = tray_icon.take();
                 main_loop_clone.quit();
+                return glib::ControlFlow::Break;
             }
         }
+
         glib::ControlFlow::Continue
     });
 
